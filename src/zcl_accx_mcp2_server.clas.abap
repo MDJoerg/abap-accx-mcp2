@@ -1,12 +1,14 @@
 "! <p class="shorttext synchronized">Access Explorer: MCP server (mcp2 adapter)</p>
 "! The only class that knows the mcp2 SDK. It maps neutral tool descriptors and
 "! results to mcp2 and contains no business logic. The server profile is
-"! '<area>/<server>' of the ZMCP2_SERVERS registration, so the class can be
+"! 'area/server' of the ZMCP2_SERVERS registration, so the class can be
 "! registered several times with different profiles (see ZACCX_PROFILE).
 "! Write tools return status confirmation_required with a stored plan: clients
 "! that support form elicitation are asked to confirm it (the plan id travels
 "! in requestState), other clients get the plan as text and must call again
 "! with plan_id and confirm = true after the user approved it.
+"! Prompts and resources of the core (ready-made instructions, glossary, FAQ, tool
+"! guide) are mapped one to one from the neutral contracts of the runtime.
 "! Run with F9 in ADT to register the default profile bc/access-support.
 CLASS zcl_accx_mcp2_server DEFINITION PUBLIC CREATE PUBLIC
   INHERITING FROM zcl_mcp2_tool_server_base.
@@ -25,6 +27,13 @@ CLASS zcl_accx_mcp2_server DEFINITION PUBLIC CREATE PUBLIC
     METHODS zif_mcp2_server~get_description     REDEFINITION.
     METHODS zif_mcp2_server~get_instructions    REDEFINITION.
     METHODS zif_mcp2_server~check_authorization REDEFINITION.
+    METHODS zif_mcp2_server~supports_prompts    REDEFINITION.
+    METHODS zif_mcp2_server~supports_resources  REDEFINITION.
+    METHODS zif_mcp2_server~prompts_list        REDEFINITION.
+    METHODS zif_mcp2_server~prompts_get         REDEFINITION.
+    METHODS zif_mcp2_server~resources_list      REDEFINITION.
+    METHODS zif_mcp2_server~resources_read      REDEFINITION.
+    METHODS zif_mcp2_server~resources_tmpls_list REDEFINITION.
 
   PROTECTED SECTION.
     METHODS define_tools REDEFINITION.
@@ -60,16 +69,12 @@ CLASS zcl_accx_mcp2_server DEFINITION PUBLIC CREATE PUBLIC
       RETURNING VALUE(result) TYPE REF TO zif_mcp2_result
       RAISING   zcx_mcp2_ajson_error.
 
-    METHODS compose_text
-      IMPORTING !tool_result  TYPE zif_accx_types=>ty_result
-      RETURNING VALUE(result) TYPE string.
-
 ENDCLASS.
 
 CLASS zcl_accx_mcp2_server IMPLEMENTATION.
 
   METHOD zif_mcp2_server~get_name.
-    result = `accx`.
+    result = zcl_accx_server_info=>co_name.
   ENDMETHOD.
 
   METHOD zif_mcp2_server~get_version.
@@ -77,23 +82,15 @@ CLASS zcl_accx_mcp2_server IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_mcp2_server~get_title.
-    result = `Access Explorer`.
+    result = zcl_accx_server_info=>co_title.
   ENDMETHOD.
 
   METHOD zif_mcp2_server~get_description.
-    result = |Analysis of SAP users, roles and authorizations in system { sy-sysid }, client { sy-mandt }.|.
+    result = zcl_accx_server_info=>description( ).
   ENDMETHOD.
 
   METHOD zif_mcp2_server~get_instructions.
-    result = |Access Explorer (release { zif_accx_types=>co_release }) answers questions about SAP users, roles and | &&
-             |authorizations in system { sy-sysid }, client { sy-mandt }. Results only contain data the calling user may | &&
-             |display; hidden entries are counted, never silently dropped. Typical flow: get_user_profile for an overview | &&
-             |of a user, then check_user_access to test whether the user may start a transaction or holds an | &&
-             |authorization. Name the missing authorization object and field values precisely. Simulated failed checks | &&
-             |also appear in the SU53 of the calling user. All tools are read-only except write tools (group ADMIN), | &&
-             |which only appear in profiles that allow writing: they first return a plan; show it to the user and execute | &&
-             |it (plan_id with confirm = true) only after the user explicitly approved exactly this plan - never on your | &&
-             |own. Answer in the language of the question.|.
+    result = zcl_accx_server_info=>instructions( ).
   ENDMETHOD.
 
   METHOD zif_mcp2_server~check_authorization.
@@ -103,6 +100,84 @@ CLASS zcl_accx_mcp2_server IMPLEMENTATION.
       CATCH cx_root.
         result = abap_false.
     ENDTRY.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~supports_prompts.
+    result = abap_true.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~supports_resources.
+    result = abap_true.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~prompts_list.
+    DATA(response) = NEW zcl_mcp2_resp_list_prompts( ).
+    DATA(ctx) = zcl_accx_factory=>context( profile = get_profile( ) ).
+    LOOP AT zcl_accx_factory=>runtime( )->get_prompts( ctx ) INTO DATA(prompt).
+      DATA(entry) = VALUE zcl_mcp2_resp_list_prompts=>prompt( name        = prompt-name
+                                                              title       = prompt-title
+                                                              description = prompt-description ).
+      LOOP AT prompt-arguments INTO DATA(argument).
+        APPEND VALUE #( name        = argument-name
+                        description = argument-description
+                        required    = argument-required ) TO entry-arguments.
+      ENDLOOP.
+      response->add_prompt( entry ).
+    ENDLOOP.
+    result = response.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~prompts_get.
+    DATA(args) = NEW zcl_accx_args_map( ).
+    LOOP AT request->get_arguments( ) INTO DATA(argument).
+      args->set( name = argument-name value = argument-value ).
+    ENDLOOP.
+    DATA(ctx) = zcl_accx_factory=>context( profile = get_profile( ) ).
+    DATA(prompt) = zcl_accx_factory=>runtime( )->get_prompt( name = request->get_name( ) args = args ctx = ctx ).
+    IF prompt-status <> zif_accx_types=>co_status-ok.
+      zcx_mcp2_error=>raise_invalid_params( prompt-message ).
+    ENDIF.
+    DATA(response) = NEW zcl_mcp2_resp_get_prompt( ).
+    response->set_description( prompt-description ).
+    LOOP AT prompt-messages INTO DATA(message).
+      IF message-role = zif_accx_prompt=>co_role-assistant.
+        response->add_assistant_text( message-text ).
+      ELSE.
+        response->add_user_text( message-text ).
+      ENDIF.
+    ENDLOOP.
+    result = response.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~resources_list.
+    DATA(response) = NEW zcl_mcp2_resp_list_resources( ).
+    DATA(ctx) = zcl_accx_factory=>context( profile = get_profile( ) ).
+    LOOP AT zcl_accx_factory=>runtime( )->get_resources( ctx ) INTO DATA(resource).
+      response->add_resource( VALUE #( uri         = resource-uri
+                                       name        = resource-name
+                                       title       = resource-title
+                                       description = resource-description
+                                       mime_type   = resource-mime_type ) ).
+    ENDLOOP.
+    result = response.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~resources_read.
+    DATA(ctx) = zcl_accx_factory=>context( profile = get_profile( ) ).
+    DATA(content) = zcl_accx_factory=>runtime( )->read_resource( uri = request->get_uri( ) ctx = ctx ).
+    IF content-status = zif_accx_types=>co_status-not_found.
+      zcx_mcp2_error=>raise_resource_not_found( request->get_uri( ) ).
+    ELSEIF content-status <> zif_accx_types=>co_status-ok.
+      zcx_mcp2_error=>raise_internal( content-message ).
+    ENDIF.
+    DATA(response) = NEW zcl_mcp2_resp_read_resource( ).
+    response->add_text_content( uri = content-uri text = content-text mime_type = content-mime_type ).
+    result = response.
+  ENDMETHOD.
+
+  METHOD zif_mcp2_server~resources_tmpls_list.
+    " no resource templates: all resources have a fixed URI
+    result = NEW zcl_mcp2_resp_list_res_tmpls( ).
   ENDMETHOD.
 
   METHOD define_tools.
@@ -232,11 +307,9 @@ CLASS zcl_accx_mcp2_server IMPLEMENTATION.
     DATA response TYPE REF TO zcl_mcp2_resp_call_tool.
     DATA json     TYPE REF TO zif_mcp2_ajson.
 
-    DATA(text) = compose_text( tool_result ).
+    DATA(text) = zcl_accx_result_text=>compose( tool_result ).
 
-    IF    tool_result-status = zif_accx_types=>co_status-denied
-       OR tool_result-status = zif_accx_types=>co_status-invalid
-       OR tool_result-status = zif_accx_types=>co_status-error.
+    IF zcl_accx_result_text=>is_failure( tool_result ) = abap_true.
       result = zcl_mcp2_resp_call_tool=>error_text( text ).
       RETURN.
     ENDIF.
@@ -257,28 +330,6 @@ CLASS zcl_accx_mcp2_server IMPLEMENTATION.
     ENDIF.
     response->add_text( text ).
     result = response.
-  ENDMETHOD.
-
-  METHOD compose_text.
-    result = COND #( WHEN tool_result-summary IS NOT INITIAL THEN tool_result-summary ELSE |Status: { tool_result-status }| ).
-    IF tool_result-status = zif_accx_types=>co_status-confirm OR tool_result-status = zif_accx_types=>co_status-partial.
-      result = |Status: { tool_result-status }\n\n{ result }|.
-    ENDIF.
-    IF tool_result-warnings IS NOT INITIAL.
-      result = |{ result }\n\nWarnings:|.
-      LOOP AT tool_result-warnings INTO DATA(warning).
-        result = |{ result }\n- { warning }|.
-      ENDLOOP.
-    ENDIF.
-    IF tool_result-next_steps IS NOT INITIAL.
-      result = |{ result }\n\nNext steps:|.
-      LOOP AT tool_result-next_steps INTO DATA(next_step).
-        result = |{ result }\n- { next_step }|.
-      ENDLOOP.
-    ENDIF.
-    IF tool_result-sources IS NOT INITIAL.
-      result = |{ result }\n\nSources: { concat_lines_of( table = tool_result-sources sep = `, ` ) }|.
-    ENDIF.
   ENDMETHOD.
 
   METHOD if_oo_adt_classrun~main.
